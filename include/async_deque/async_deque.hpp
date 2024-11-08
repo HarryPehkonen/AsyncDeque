@@ -11,20 +11,20 @@
  * @brief Thread-safe asynchronous double-ended queue implementation
  * @author Harri Pehkonen
  * @date 2024
- * 
+ *
  * @details This header provides a thread-safe, capacity-bounded double-ended queue
  * with support for blocking and non-blocking operations, timeouts, and extension mechanisms.
- * 
+ *
  * Example usage:
  * @code{.cpp}
  * AsyncDeque<int> queue(100);  // Create a queue with capacity 100
- * 
+ *
  * // Producer thread
  * queue.push_back(42);
  * if (queue.try_push_back(43, 100ms)) {
  *     // Successfully pushed within timeout
  * }
- * 
+ *
  * // Consumer thread
  * if (auto value = queue.pop_front()) {
  *     std::cout << "Got value: " << *value << std::endl;
@@ -44,9 +44,9 @@ class AsyncDeque;
 
 /**
  * @brief A thread-safe asynchronous double-ended queue
- * 
+ *
  * @tparam T The type of elements to store in the queue
- * 
+ *
  * This class implements a thread-safe double-ended queue with the following features:
  * - Bounded capacity
  * - Blocking and non-blocking operations
@@ -54,10 +54,10 @@ class AsyncDeque;
  * - RAII-compliant resource management
  * - Move semantics support
  * - Extension mechanism through virtual hooks
- * 
+ *
  * @note All public methods are thread-safe
  * @warning Copy operations are explicitly deleted
- * 
+ *
  * @invariant capacity() remains constant throughout the object's lifetime
  * @invariant size() <= capacity() at all times
  */
@@ -115,10 +115,10 @@ protected:
 public:
     /**
      * @brief Constructs an AsyncDeque with the specified capacity
-     * 
+     *
      * @param capacity Maximum number of items the queue can hold
      * @throws std::bad_alloc if memory allocation fails
-     * 
+     *
      * @post empty() == true
      * @post is_closed() == false
      * @post this->capacity() == capacity
@@ -128,7 +128,7 @@ public:
 
     /**
      * @brief Destructor
-     * 
+     *
      * Ensures the queue is closed before destruction.
      * @note This will wake up any threads waiting on the queue
      */
@@ -144,9 +144,9 @@ public:
 
     /**
      * @brief Move constructor
-     * 
+     *
      * @param other Queue to move from
-     * 
+     *
      * @note noexcept guarantee
      * @post other is empty but valid
      */
@@ -159,10 +159,10 @@ public:
 
     /**
      * @brief Move assignment operator
-     * 
+     *
      * @param other Queue to move from
      * @return AsyncDeque& Reference to *this
-     * 
+     *
      * @note If capacities don't match, the operation is a no-op
      * @note noexcept guarantee
      */
@@ -187,6 +187,42 @@ public:
     /** @} */
 
     /**
+     * @name Queue state queries
+     * @{
+     */
+    bool empty() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return deque_.empty();
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return deque_.size();
+    }
+
+    size_t capacity() const {
+        return capacity_;
+    }
+
+    bool is_closed() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return closed_;
+    }
+
+    void close() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!closed_) {
+                closed_ = true;
+                on_close();
+            }
+        }
+        cv_.notify_all();
+    }
+
+    /** @} */
+
+    /**
      * @name Push Operations
      * Methods for adding items to the queue
      * @{
@@ -194,45 +230,179 @@ public:
 
     /**
      * @brief Pushes an item to the back of the queue
-     * 
+     *
      * @tparam U Type of the item (must be convertible to T)
      * @param item Item to push
      * @return true if the item was pushed successfully
      * @return false if the queue is closed
-     * 
+     *
      * @note Blocks if the queue is at capacity
      * @throws Any exception thrown by T's move/copy constructor
      */
     template<typename U>
-    bool push_back(U&& item);  // Implementation as before...
+    bool push_back(U&& item) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] {
+            return closed_ || deque_.size() < capacity_;
+        });
 
+        if (closed_) return false;
+
+        deque_.push_back(std::forward<U>(item));
+        on_push_back(deque_.back());
+        lock.unlock();
+        cv_.notify_one();
+        return true;
+    }
+
+    template<typename U>
+    bool push_front(U&& item) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] {
+            return closed_ || deque_.size() < capacity_;
+        });
+
+        if (closed_) return false;
+
+        deque_.push_front(std::forward<U>(item));
+        on_push_front(deque_.front());
+        lock.unlock();
+        cv_.notify_one();
+        return true;
+    }
     /**
      * @brief Attempts to push an item to the back with a timeout
-     * 
+     *
      * @tparam Rep Type representing the number of ticks
      * @tparam Period Type representing the tick period
      * @param item Item to push
      * @param timeout Maximum time to wait
      * @return true if the item was pushed
      * @return false if timed out or queue is closed
-     * 
+     *
      * @throws Any exception thrown by T's copy constructor
      */
     template<typename Rep, typename Period>
-    bool try_push_back(const T& item, 
-                      const std::chrono::duration<Rep, Period>& timeout);
+    bool try_push_back(const T& item, const std::chrono::duration<Rep, Period>& timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!cv_.wait_for(lock, timeout, [this] {
+            return closed_ || deque_.size() < capacity_;
+        })) {
+            return false;
+        }
+
+        if (closed_) return false;
+
+        deque_.push_back(item);
+        on_push_back(deque_.back());
+        lock.unlock();
+        cv_.notify_one();
+        return true;
+    }
+
+    template<typename Rep, typename Period>
+    bool try_push_front(const T& item, const std::chrono::duration<Rep, Period>& timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!cv_.wait_for(lock, timeout, [this] {
+            return closed_ || deque_.size() < capacity_;
+        })) {
+            return false;
+        }
+
+        if (closed_) return false;
+
+        deque_.push_front(item);
+        on_push_front(deque_.front());
+        lock.unlock();
+        cv_.notify_one();
+        return true;
+    }
 
     /** @} */  // End of Push Operations
 
-    // ... Similar comprehensive documentation for other methods ...
+    /**
+     * @name Pop Operations
+     * Methods for removing items from the queue
+     * @{
+     */
+    std::optional<T> pop_front() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] {
+            return closed_ || !deque_.empty();
+        });
+
+        if (deque_.empty()) return std::nullopt;
+
+        T item = std::move(deque_.front());
+        deque_.pop_front();
+        on_pop_front(item);
+        lock.unlock();
+        cv_.notify_one();
+        return item;
+    }
+
+    std::optional<T> pop_back() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] {
+            return closed_ || !deque_.empty();
+        });
+
+        if (deque_.empty()) return std::nullopt;
+
+        T item = std::move(deque_.back());
+        deque_.pop_back();
+        on_pop_back(item);
+        lock.unlock();
+        cv_.notify_one();
+        return item;
+    }
+
+    template<typename Rep, typename Period>
+    std::optional<T> try_pop_front(const std::chrono::duration<Rep, Period>& timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!cv_.wait_for(lock, timeout, [this] {
+            return closed_ || !deque_.empty();
+        })) {
+            return std::nullopt;
+        }
+
+        if (deque_.empty()) return std::nullopt;
+
+        T item = std::move(deque_.front());
+        deque_.pop_front();
+        on_pop_front(item);
+        lock.unlock();
+        cv_.notify_one();
+        return item;
+    }
+
+    template<typename Rep, typename Period>
+    std::optional<T> try_pop_back(const std::chrono::duration<Rep, Period>& timeout) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (!cv_.wait_for(lock, timeout, [this] {
+            return closed_ || !deque_.empty();
+        })) {
+            return std::nullopt;
+        }
+
+        if (deque_.empty()) return std::nullopt;
+
+        T item = std::move(deque_.back());
+        deque_.pop_back();
+        on_pop_back(item);
+        lock.unlock();
+        cv_.notify_one();
+        return item;
+    }
+    /** @} */  // End of Pop Operations
 
     /**
      * @brief Queries if a specific extension type is present
-     * 
+     *
      * @tparam E The extension type to check for
      * @return true if the extension is present
      * @return false if the extension is not present
-     * 
+     *
      * @note Thread-safe
      * @see AsyncDeque template with Extensions
      */
@@ -245,12 +415,12 @@ public:
 /**
  * @class async_deque::AsyncDeque
  * @example producer_consumer.cpp
- * 
+ *
  * This example shows how to use AsyncDeque in a producer-consumer scenario:
- * 
+ *
  * @code
  * AsyncDeque<int> queue(100);
- * 
+ *
  * // Producer thread
  * std::thread producer([&queue]() {
  *     for (int i = 0; i < 1000; ++i) {
@@ -259,7 +429,7 @@ public:
  *         }
  *     }
  * });
- * 
+ *
  * // Consumer thread
  * std::thread consumer([&queue]() {
  *     while (true) {
